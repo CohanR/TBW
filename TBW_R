@@ -1,0 +1,144 @@
+# Written for Javier's TBW project, July 25, 2025. RC
+# ==== Load libraries or packages you need ====
+library(tidyverse)
+library(readr)
+library(minpack.lm)
+
+# ==== Exclude subject(s) here ====
+exclude_subject <- NA  # e.g., "sub-001" to exclude, or NA to include all
+
+# ==== Load the data here====
+data <- read_csv("/Users/remycohan/Downloads/TBW_data.csv")
+
+# exclude subject if set (don't touch)
+if (!is.na(exclude_subject)) {
+  data <- data %>% filter(sub_id != exclude_subject)
+  cat("Excluded subject:", exclude_subject, "\n")
+}
+
+# ==== Extract SOA (stimulus onset asynchrony) columns ====
+soa_cols <- names(data)[grepl("^soa-?-?\\d+$", names(data))]
+
+# ==== Javier's TBW helper (matching your calculations) function ====
+find_tbw_javier <- function(soa, prop) {
+  df <- tibble(soa = soa, prop = prop) %>% distinct() %>% arrange(soa)
+  
+  # Left side (negative SOAs, AV)
+  left <- df %>% filter(soa < 0) %>% arrange(desc(soa))
+  left_idx <- which(left$prop < 0.5)[1]
+  left_cross <- if (!is.na(left_idx) && left_idx > 1) {
+    x1 <- left$soa[left_idx - 1]; y1 <- left$prop[left_idx - 1]
+    x2 <- left$soa[left_idx]; y2 <- left$prop[left_idx]
+    x1 + (0.5 - y1) * (x2 - x1) / (y2 - y1)
+  } else NA_real_
+  
+  # Right side (positive SOAs, VA)
+  right <- df %>% filter(soa > 0) %>% arrange(soa)
+  right_idx <- which(right$prop < 0.5)[1]
+  right_cross <- if (!is.na(right_idx) && right_idx > 1) {
+    x1 <- right$soa[right_idx - 1]; y1 <- right$prop[right_idx - 1]
+    x2 <- right$soa[right_idx]; y2 <- right$prop[right_idx]
+    x1 + (0.5 - y1) * (x2 - x1) / (y2 - y1)
+  } else NA_real_
+  
+  full_tbw <- if (!is.na(left_cross) & !is.na(right_cross)) abs(right_cross - left_cross) else NA_real_
+  
+  list(full = full_tbw, av = left_cross, va = right_cross)
+}
+
+# ==== Reshape the data to long format ====
+long_data <- data %>%
+  select(sub_id, all_of(soa_cols)) %>%
+  pivot_longer(-sub_id, names_to = "SOA", values_to = "prop") %>%
+  mutate(SOA = as.numeric(str_remove(SOA, "soa")))
+
+# ==== Calculate TBW and Gaussian fit per subject ====
+subject_tbw <- long_data %>%
+  group_by(sub_id) %>%
+  group_modify(~{
+    df <- .x
+    subject <- .y$sub_id  # safely extract subject ID
+    tbw_res <- find_tbw_javier(df$SOA, df$prop)
+    
+    fit <- try(nlsLM(prop ~ a * exp(-((SOA - b)^2) / (2 * c^2)),
+                     data = df,
+                     start = list(a = max(df$prop, na.rm = TRUE), b = 0, c = 100)),
+               silent = TRUE)
+    
+    gauss_tbw <- if (inherits(fit, "try-error")) NA else 2.355 * coef(fit)['c']
+    df <- df %>%
+      mutate(
+        gauss_fit = if (inherits(fit, "try-error")) NA_real_ else predict(fit, newdata = df),
+        javier_TBW = tbw_res$full,
+        gaussian_TBW = gauss_tbw
+      )
+    
+    # Print subject info without re-adding sub_id
+    cat("\nSubject:", subject,
+        "\n  Javier's TBW:", round(tbw_res$full,1), "ms",
+        "\n  Gaussian TBW:", round(gauss_tbw,1), "ms",
+        "\n  Left AV crossing (negative SOA):", round(tbw_res$av,1), "ms",
+        "\n  Right VA crossing (positive SOA):", round(tbw_res$va,1), "ms\n")
+    
+    df
+  }) %>%
+  ungroup()
+
+
+# ==== Plot per subject (only Javier + Gaussian TBW) ====
+ggplot(subject_tbw, aes(x = SOA, y = prop)) +
+  geom_point() +
+  geom_line(aes(y = gauss_fit), color = "red") +
+  facet_wrap(~sub_id) +
+  labs(title = "Per-subject Proportion vs SOA with Gaussian Fit",
+       x = "SOA (ms)", y = "Proportion Simultaneous") +
+  theme_minimal() +
+  geom_text(
+    data = subject_tbw %>%
+      group_by(sub_id) %>%
+      summarise(javier_TBW = first(javier_TBW),
+                gaussian_TBW = first(gaussian_TBW),
+                x = min(SOA), y = max(prop, na.rm = TRUE) + 0.3, .groups = "drop"),
+    aes(x = x, y = y,
+        label = paste0("Javier's TBW: ", round(javier_TBW,1),
+                       " ms\nGaussian TBW: ", round(gaussian_TBW,1), " ms")),
+    hjust = -0.1, vjust = 1.1, size = 3, inherit.aes = FALSE
+  )
+# ==== Group level summary ====
+group_summary <- long_data %>%
+  group_by(SOA) %>%
+  summarise(mean_prop = mean(prop, na.rm = TRUE),
+            sd_prop = sd(prop, na.rm = TRUE),
+            se_prop = sd_prop / sqrt(n()), .groups = "drop")
+
+gauss_group <- nlsLM(mean_prop ~ a * exp(-((SOA - b)^2) / (2 * c^2)),
+                     data = group_summary,
+                     start = list(a = max(group_summary$mean_prop, na.rm = TRUE), b = 0, c = 100))
+group_fwhm <- 2.355 * coef(gauss_group)['c']
+group_summary <- group_summary %>%
+  mutate(gauss_fit = predict(gauss_group, newdata = group_summary))
+
+group_tbw_res <- find_tbw_javier(group_summary$SOA, group_summary$mean_prop)
+group_javier_tbw <- group_tbw_res$full
+group_av_tbw <- group_tbw_res$av
+group_va_tbw <- group_tbw_res$va
+
+# ==== Print group TBWs ====
+cat("\nGroup-level TBWs:",
+    "\n  Javier's TBW:", round(group_javier_tbw,1), "ms",
+    "\n  Gaussian TBW:", round(group_fwhm,1), "ms",
+    "\n  Left AV crossing (negative SOA):", round(group_av_tbw,1), "ms",
+    "\n  Right VA crossing (positive SOA):", round(group_va_tbw,1), "ms\n")
+
+# ==== Plot group level data ====
+ggplot(group_summary, aes(x = SOA, y = mean_prop)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_prop - se_prop, ymax = mean_prop + se_prop), width = 10) +
+  geom_line(aes(y = gauss_fit), color = "red", linewidth = 1) +
+  labs(title = "Group Mean Proportion vs SOA with Gaussian Fit",
+       x = "SOA (ms)", y = "Mean Proportion Simultaneous") +
+  theme_minimal() +
+  annotate("text", x = min(group_summary$SOA), y = max(group_summary$mean_prop) + 0.1,
+           label = paste0("Javier's TBW: ", round(group_javier_tbw,1), " ms\nGaussian TBW: ", round(group_fwhm,1), " ms"),
+           hjust = -0.1, vjust = 1.1, size = 4)
+
