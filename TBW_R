@@ -8,7 +8,7 @@ library(minpack.lm)
 exclude_subject <- NA  # e.g., "sub-001" to exclude, or NA to include all
 
 # ==== Load the data here====
-data <- read_csv("/Users/remycohan/Downloads/TBW_data.csv")
+data <- read_csv("/Users/remy/Downloads/TBW_data.csv")
 
 # exclude subject if set (don't touch)
 if (!is.na(exclude_subject)) {
